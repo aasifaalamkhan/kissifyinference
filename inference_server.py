@@ -196,19 +196,19 @@ async def startup_event():
         raise e
     
     
-    async def shutdown_event():
-    # Cleanup resources
+async def shutdown_event():
+# Cleanup resources
         global pipeline, thread_pool, redis_client
-    if pipeline:
+if pipeline:
         del pipeline
         torch.cuda.empty_cache()
     
-    thread_pool.shutdown(wait=True)
+thread_pool.shutdown(wait=True)
     
-    if redis_client:
+if redis_client:
         redis_client.close()
     
-    logger.info("🛑 Server shutdown complete")
+logger.info("🛑 Server shutdown complete")
 
 # Authentication functions
 async def create_jwt_token(user_data: dict, expires_delta: Optional[timedelta] = None):
