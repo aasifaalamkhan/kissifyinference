@@ -1,4 +1,4 @@
-# inference_server.py - With authentication, refactored image processing, and IP-Adapter fix
+# inference_server.py - With authentication, refactored image processing, and manual IP-Adapter loading
 import os
 import io
 import base64
@@ -14,8 +14,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
-from transformers import CLIPVisionModel
+# --- MODIFIED IMPORTS ---
+from diffusers import AutoencoderKLWan, WanImageToVideoPipeline, IPAdapterModel
+from transformers import CLIPVisionModel, CLIPImageProcessor
 import imageio
 import b2sdk.v2 as b2
 from contextlib import asynccontextmanager
@@ -46,7 +47,7 @@ API_KEY_HEADER = "X-API-Key"
 class User(BaseModel):
     user_id: str
     email: Optional[str] = None
-    tier: str = "free"  # free, premium, enterprise
+    tier: str = "free"
     daily_limit: int = 10
     monthly_limit: int = 100
 
@@ -66,7 +67,6 @@ class GenerationRequest(BaseModel):
     fps: int = Field(16, ge=8, le=30, description="Frames per second")
     resolution: str = Field("480p", description="Output resolution")
     adapter_strength: float = Field(1.0, ge=0.0, le=2.0, description="LoRA adapter strength")
-    # --- ADDED FOR IP-ADAPTER ---
     ip_adapter_scale: float = Field(0.8, ge=0.0, le=1.5, description="IP-Adapter strength")
     priority: Optional[str] = Field("normal", description="Job priority (normal, high)")
 
@@ -102,8 +102,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Kissing Video Generator API",
-    version="3.1.0",
-    description="Secure API for generating kissing videos with IP-Adapter, authentication and debug features",
+    version="3.2.0",
+    description="Secure API for generating kissing videos with manual IP-Adapter loading, authentication and debug features",
     lifespan=lifespan
 )
 
@@ -116,20 +116,10 @@ app.add_middleware(
 )
 
 async def startup_event():
-    #Initialize the model and services#
     global pipeline, device, b2_api, b2_bucket, redis_client
-
     logger.info("🚀 Starting secure inference server...")
-
-    # Initialize Redis
-    redis_client = redis.Redis(
-        host=os.getenv('REDIS_HOST', 'localhost'),
-        port=int(os.getenv('REDIS_PORT', 6379)),
-        password=os.getenv('REDIS_PASSWORD'),
-        db=0,
-        decode_responses=True
-    )
-
+    
+    redis_client = redis.Redis( host=os.getenv('REDIS_HOST', 'localhost'), port=int(os.getenv('REDIS_PORT', 6379)), password=os.getenv('REDIS_PASSWORD'), db=0, decode_responses=True )
     try:
         redis_client.ping()
         logger.info("✅ Redis connected for authentication")
@@ -137,7 +127,6 @@ async def startup_event():
         logger.error(f"❌ Redis connection failed: {e}")
         redis_client = None
 
-    # GPU setup
     if torch.cuda.is_available():
         device = "cuda"
         gpu_name = torch.cuda.get_device_name(0)
@@ -146,84 +135,59 @@ async def startup_event():
     else:
         device = "cpu"
         logger.warning("⚠️ No GPU detected, using CPU (will be very slow)")
-
-    # Initialize Backblaze B2
+    
     await initialize_b2()
-
+    
     try:
         model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
-
-        # Step 1: Load the image encoder
+        
         logger.info("📥 Loading Image Encoder (CLIP)...")
-        image_encoder = CLIPVisionModel.from_pretrained(
-            model_id, subfolder="image_encoder", torch_dtype=torch.bfloat16
-        )
-
-        # Step 2: Load the VAE
+        image_encoder = CLIPVisionModel.from_pretrained( model_id, subfolder="image_encoder", torch_dtype=torch.bfloat16 )
+        
         logger.info("📥 Loading VAE...")
-        vae = AutoencoderKLWan.from_pretrained(
-            model_id, subfolder="vae", torch_dtype=torch.float32
-        )
-
-        # Step 3: Load the main pipeline with the other components
+        vae = AutoencoderKLWan.from_pretrained( model_id, subfolder="vae", torch_dtype=torch.float32 )
+        
         logger.info("📥 Loading Main I2V Pipeline...")
-        pipeline = WanImageToVideoPipeline.from_pretrained(
-            model_id, image_encoder=image_encoder, vae=vae, torch_dtype=torch.bfloat16
-        )
-
-        # Load the kissing LoRA
+        pipeline = WanImageToVideoPipeline.from_pretrained( model_id, image_encoder=image_encoder, vae=vae, torch_dtype=torch.bfloat16 )
+        
         logger.info("💋 Loading kissing LoRA...")
-        pipeline.load_lora_weights(
-            "Remade-AI/kissing",
-            adapter_name="kissing",
-            weight_name="kissing_30_epochs.safetensors"
-        )
-
-        # --- ADDED FOR IP-ADAPTER ---
-        logger.info("🎨 Loading IP-Adapter...")
-        # Load the IP-Adapter, which is crucial for conditioning the model on the input image
-        pipeline.load_ip_adapter(
-            "h94/IP-Adapter",
-            subfolder="models",
-            weight_name="ip-adapter-plus_sd15.bin"
-        )
-        # --- END IP-ADAPTER ADDITION ---
+        pipeline.load_lora_weights( "Remade-AI/kissing", adapter_name="kissing", weight_name="kissing_30_epochs.safetensors" )
+        
+        # --- MODIFIED IP-ADAPTER LOADING ---
+        logger.info("🎨 Manually loading IP-Adapter components...")
+        # Since the pipeline doesn't have a built-in .load_ip_adapter(), we load the components manually.
+        ip_adapter_id = "h94/IP-Adapter"
+        pipeline.ip_adapter = IPAdapterModel.from_pretrained(ip_adapter_id, subfolder="models", weight_name="ip-adapter-plus_sd15.bin", torch_dtype=torch.bfloat16)
+        # We need the specific image processor that corresponds to the IP-Adapter's vision encoder
+        pipeline.image_processor_ip = CLIPImageProcessor.from_pretrained(model_id, subfolder="image_encoder")
+        # --- END MODIFICATION ---
 
         pipeline.to(device)
+        pipeline.ip_adapter.to(device)
 
-        # Enable optimizations
         if hasattr(pipeline, 'enable_xformers_memory_efficient_attention'):
             pipeline.enable_xformers_memory_efficient_attention()
-
         if device == "cuda":
             pipeline.enable_model_cpu_offload()
 
         logger.info("✅ Model loaded successfully!")
-
-        # Warm up
         await warmup_model()
-
+        
     except Exception as e:
         logger.error(f"❌ Failed to load model: {str(e)}")
         raise e
 
-
 async def shutdown_event():
-# Cleanup resources
     global pipeline, thread_pool, redis_client
     if pipeline:
         del pipeline
         torch.cuda.empty_cache()
-
     thread_pool.shutdown(wait=True)
-
     if redis_client:
         redis_client.close()
-
     logger.info("🛑 Server shutdown complete")
 
-# --- ALL AUTHENTICATION, IMAGE PROCESSING, AND UTILITY FUNCTIONS REMAIN THE SAME ---
-# ... (functions from create_jwt_token to convert_pil_to_bytes_async are unchanged) ...
+# ... (Authentication, B2, and other utility functions remain unchanged) ...
 async def create_jwt_token(user_data: dict, expires_delta: Optional[timedelta] = None):
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
@@ -471,24 +435,31 @@ async def convert_pil_to_bytes_async(image: Image.Image, format: str = "JPEG") -
 
 
 async def warmup_model():
-    #Warm up model with proper LoRA and IP-Adapter usage#
     try:
+        logger.info("🔥 Warming up model with manual IP-Adapter logic...")
         test_image = Image.new('RGB', (512, 512), color='blue')
         test_prompt = "A couple standing together, they are k144ing kissing"
 
         pipeline.set_adapters(["kissing"], adapter_weights=[1.0])
-        # --- ADDED FOR IP-ADAPTER ---
-        pipeline.set_ip_adapter_scale(0.8)
+        
+        # --- MODIFIED WARMUP FOR MANUAL IP-ADAPTER ---
+        ip_image = pipeline.image_processor_ip(test_image, return_tensors="pt").pixel_values.to(device, dtype=torch.bfloat16)
+        image_embeds = pipeline.ip_adapter.get_image_embeds(ip_image)
+        scaled_embeds = image_embeds * 0.8 # Use default scale for warmup
+        
+        negative_embeds = torch.zeros_like(scaled_embeds)
+        final_embeds = torch.cat([scaled_embeds, negative_embeds])
+        
+        cross_attention_kwargs = {"ip_adapter_image_embeds": final_embeds}
+        # --- END MODIFICATION ---
 
-        generator = torch.Generator(device=device)
-        generator.manual_seed(42)
+        generator = torch.Generator(device=device).manual_seed(42)
 
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             output = pipeline(
                 image=test_image,
-                # --- ADDED FOR IP-ADAPTER ---
-                ip_adapter_image=test_image,
                 prompt=test_prompt,
+                cross_attention_kwargs=cross_attention_kwargs,
                 num_frames=40,
                 guidance_scale=7.5,
                 height=480,
@@ -503,108 +474,77 @@ async def warmup_model():
     except Exception as e:
         logger.error(f"⚠️ Warmup failed: {str(e)}")
 
-# Main Generation Endpoint
 @app.post("/generate", response_model=GenerationResponse)
-async def generate_video(
-    request: GenerationRequest,
-    current_user: User = Depends(get_current_user)
-):
-    #Generate kissing video with authentication and rate limiting#
+async def generate_video(request: GenerationRequest, current_user: User = Depends(get_current_user)):
     global pipeline
     start_time = datetime.now()
 
     if not pipeline:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # Check rate limits
     rate_info = await check_rate_limits(current_user)
-
-    # Calculate credit cost
     credits_cost = calculate_credits_cost(request, current_user)
 
     try:
         logger.info(f"🎬 Starting authenticated video generation for user {current_user.user_id}")
         logger.info(f"💳 Credits cost: {credits_cost}")
 
-        # Use the main video timestamp for unique debug filenames
         timestamp = int(datetime.now().timestamp())
-
-        # Decode images first
-        images = []
-        for i, img_b64 in enumerate(request.input_images):
-            try:
-                image = decode_base64_image(img_b64)
-                images.append(image)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Error decoding image {i+1}: {str(e)}")
-
-        # --- Image Processing with Debug Uploads ---
-
+        images = [decode_base64_image(img_b64) for i, img_b64 in enumerate(request.input_images)]
+        
         if len(images) == 2:
             stitched_image = await stitch_images_side_by_side_async(images[0], images[1])
-            logger.info("🔧 Uploading RAW STITCHED debug image to B2...")
             raw_bytes = await convert_pil_to_bytes_async(stitched_image)
-            raw_filename = f"debug/{current_user.user_id}/stitched_raw_{timestamp}.jpg"
-            asyncio.create_task(upload_to_b2(raw_bytes, raw_filename, "image/jpeg"))
-
+            asyncio.create_task(upload_to_b2(raw_bytes, f"debug/{current_user.user_id}/stitched_raw_{timestamp}.jpg", "image/jpeg"))
             input_image = await preprocess_single_image_async(stitched_image)
-            logger.info("🔧 Uploading FINAL PREPROCESSED debug image to B2...")
-            processed_bytes = await convert_pil_to_bytes_async(input_image)
-            processed_filename = f"debug/{current_user.user_id}/final_input_{timestamp}.jpg"
-            asyncio.create_task(upload_to_b2(processed_bytes, processed_filename, "image/jpeg"))
-            logger.info("✅ Combined and processed 2 images.")
-
         elif len(images) == 1:
             input_image = await preprocess_single_image_async(images[0])
-            logger.info("🔧 Uploading FINAL PREPROCESSED debug image to B2...")
-            processed_bytes = await convert_pil_to_bytes_async(input_image)
-            processed_filename = f"debug/{current_user.user_id}/final_input_{timestamp}.jpg"
-            asyncio.create_task(upload_to_b2(processed_bytes, processed_filename, "image/jpeg"))
-            logger.info("✅ Processed 1 image.")
         else:
             raise HTTPException(status_code=400, detail="Please provide 1 or 2 input images.")
 
+        processed_bytes = await convert_pil_to_bytes_async(input_image)
+        asyncio.create_task(upload_to_b2(processed_bytes, f"debug/{current_user.user_id}/final_input_{timestamp}.jpg", "image/jpeg"))
 
-        # --- New, Stronger Prompt Enhancement Logic ---
         user_context = request.prompt.strip()
-
         for word in ["kissing", "k144ing", "kiss", "a couple", "a man and a woman"]:
             user_context = user_context.lower().replace(word, "")
-
-        enhanced_prompt = (
-            f"masterpiece, best quality, high resolution, "
-            f"A man and a woman, {user_context.strip()}, are embracing each other closely. "
-            f"They then engage in a passionate and intimate k144ing kissing scene."
-        )
-
+        enhanced_prompt = f"masterpiece, best quality, high resolution, A man and a woman, {user_context.strip()}, are embracing each other closely. They then engage in a passionate and intimate k144ing kissing scene."
         logger.info(f"📝 Using new enhanced prompt: {enhanced_prompt}")
 
-        # --- MODIFIED FOR IP-ADAPTER ---
-        # Set LoRA adapter with proper strength control
         pipeline.set_adapters(["kissing"], adapter_weights=[request.adapter_strength])
         logger.info(f"🎛️ Set LoRA adapter strength: {request.adapter_strength}")
 
-        # Set IP-Adapter scale to control image prompt strength
-        pipeline.set_ip_adapter_scale(request.ip_adapter_scale)
-        logger.info(f"🎨 Using IP-Adapter scale: {request.ip_adapter_scale}")
+        # --- MODIFIED FOR MANUAL IP-ADAPTER ---
+        logger.info(f"🎨 Processing image for IP-Adapter with scale: {request.ip_adapter_scale}")
+        # 1. Process the image with the IP-Adapter's specific processor
+        ip_image = pipeline.image_processor_ip(input_image, return_tensors="pt").pixel_values.to(device, dtype=torch.bfloat16)
+        
+        # 2. Get the image embeddings from the IP-Adapter model
+        image_embeds = pipeline.ip_adapter.get_image_embeds(ip_image)
+
+        # 3. Scale the embeddings and create negative embeddings for classifier-free guidance
+        scaled_embeds = image_embeds * request.ip_adapter_scale
+        negative_embeds = torch.zeros_like(scaled_embeds)
+
+        # The pipeline expects the embeddings to be concatenated (positive, negative)
+        final_embeds = torch.cat([scaled_embeds, negative_embeds])
+
+        # 4. Pass the embeddings through cross_attention_kwargs
+        cross_attention_kwargs = {"ip_adapter_image_embeds": final_embeds}
         # --- END MODIFICATION ---
 
-        # Create isolated generator for seed
         generator = None
         if request.seed:
             generator = torch.Generator(device=device).manual_seed(request.seed)
             logger.info(f"🎲 Using seed: {request.seed}")
 
-        # Generate video
         logger.info("🎥 Generating video...")
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             output = pipeline(
-                # --- MODIFIED FOR IP-ADAPTER ---
-                image=input_image,              # Initial frame for video motion
-                ip_adapter_image=input_image,   # Image for IP-Adapter conditioning
-                # --- END MODIFICATION ---
+                image=input_image,
                 prompt=enhanced_prompt,
                 negative_prompt=request.negative_prompt,
+                cross_attention_kwargs=cross_attention_kwargs, # Pass the custom embeddings here
                 num_frames=request.num_frames,
                 guidance_scale=request.guidance_scale,
                 height=480 if request.resolution == "480p" else 720,
@@ -613,21 +553,14 @@ async def generate_video(
                 generator=generator
             )
 
-        # Process frames with imageio
         frames = output.frames[0]
         frames_np = [np.array(frame) for frame in frames]
-
-        logger.info("🎞️ Converting frames to video with imageio...")
         video_bytes = await process_frames_to_video_bytes_imageio(frames_np, request.fps)
-
-        logger.info("📸 Creating thumbnail with imageio...")
         thumbnail_bytes = await create_thumbnail_bytes_imageio(frames_np)
 
-        # Upload final video and thumbnail to B2
         video_filename = f"videos/{current_user.user_id}/kissing_video_{timestamp}.mp4"
         thumbnail_filename = f"thumbnails/{current_user.user_id}/thumb_{timestamp}.jpg"
 
-        logger.info("☁️ Uploading final assets to Backblaze B2...")
         video_url, thumbnail_url = await asyncio.gather(
             upload_to_b2(video_bytes, video_filename, "video/mp4"),
             upload_to_b2(thumbnail_bytes, thumbnail_filename, "image/jpeg")
@@ -637,15 +570,9 @@ async def generate_video(
         monthly_remaining = rate_info.get("monthly_remaining", 0)
 
         return GenerationResponse(
-            status="success",
-            video_url=video_url,
-            thumbnail_url=thumbnail_url,
-            duration=float(len(frames_np) / request.fps),
-            frames_generated=len(frames_np),
-            processing_time=total_time,
-            cost_estimate=float(credits_cost),
-            credits_used=credits_cost,
-            remaining_credits=monthly_remaining,
+            status="success", video_url=video_url, thumbnail_url=thumbnail_url, duration=float(len(frames_np) / request.fps),
+            frames_generated=len(frames_np), processing_time=total_time, cost_estimate=float(credits_cost),
+            credits_used=credits_cost, remaining_credits=monthly_remaining,
         )
 
     except Exception as e:
