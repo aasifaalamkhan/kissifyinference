@@ -160,7 +160,7 @@ async def startup_event():
         # Step 2: Load the VAE
         logger.info("📥 Loading VAE...")
         vae = AutoencoderKLWan.from_pretrained(
-            model_id, subfolder="vae", torch_dtype=torch.bfloat16
+            model_id, subfolder="vae", torch_dtype=torch.float32
         )
         
         # Step 3: Load the main pipeline with the other components
@@ -557,7 +557,6 @@ async def process_frames_to_video_bytes_imageio(frames: List[np.ndarray], fps: i
                 codec='libx264',
                 quality=8,
                 pixelformat='yuv420p',
-                macro_block_size=1
             ) as writer:
                 for frame in processed_frames:
                     writer.append_data(frame)
@@ -672,8 +671,8 @@ async def warmup_model():
             output = pipeline(
                 image=test_image,
                 prompt=test_prompt,
-                num_frames=25,
-                guidance_scale=6.0,
+                num_frames=40,
+                guidance_scale=7.5,
                 height=480,
                 width=480,
                 generator=generator
