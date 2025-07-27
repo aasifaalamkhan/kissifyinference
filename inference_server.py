@@ -753,12 +753,21 @@ async def generate_video(
             raise HTTPException(status_code=400, detail="Please provide 1 or 2 input images.")
 
 
-        # Enhanced prompt
-        enhanced_prompt = f"{request.prompt.strip()}, they are k144ing kissing"
-        if not any(word in request.prompt.lower() for word in ['kiss', 'k144ing']):
-            enhanced_prompt = f"A couple {request.prompt.strip()}, they are k144ing kissing"
+        # --- New, Stronger Prompt Enhancement Logic ---
+        user_context = request.prompt.strip()
 
-        logger.info(f"📝 Using prompt: {enhanced_prompt}")
+        # Clean the user's input to avoid redundant phrasing
+        for word in ["kissing", "k144ing", "kiss", "a couple", "a man and a woman"]:
+            user_context = user_context.lower().replace(word, "")
+        
+        # This robust template ensures the prompt is always descriptive and well-structured
+        enhanced_prompt = (
+            f"masterpiece, best quality, high resolution, "
+            f"A man and a woman, {user_context.strip()}, are embracing each other closely. "
+            f"They then engage in a passionate and intimate k144ing kissing scene."
+        )
+
+        logger.info(f"📝 Using new enhanced prompt: {enhanced_prompt}")
 
         # Set LoRA adapter with proper strength control
         pipeline.set_adapters(["kissing"], adapter_weights=[request.adapter_strength])
