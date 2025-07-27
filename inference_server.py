@@ -735,7 +735,6 @@ async def generate_video(
         logger.info(f"📝 Using prompt: {enhanced_prompt}")
 
         # Set LoRA adapter with proper strength control
-        pipeline.load_lora_weights("Remade-AI/kissing", adapter_name="kissing", weight_name="kissing_30_epochs.safetensors")
         pipeline.set_adapters(["kissing"], adapter_weights=[request.adapter_strength])
         logger.info(f"🎛️ Set LoRA adapter strength: {request.adapter_strength}")
 
