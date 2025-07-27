@@ -421,6 +421,7 @@ async def combine_couple_images_async(img1: Image.Image, img2: Image.Image) -> I
     
     # First combine, then use our superior preprocessing
     combined = await asyncio.to_thread(_combine)
+    return combined
     
     # Apply the same advanced preprocessing used for single images
     return await preprocess_single_image_async(combined, target_size=(512, 512))
@@ -708,24 +709,26 @@ async def generate_video(
         logger.info(f"🎬 Starting authenticated video generation for user {current_user.user_id}")
         logger.info(f"💳 Credits cost: {credits_cost}")
 
-        # Decode and preprocess images using refactored functions
+# Decode images first without preprocessing
         images = []
         for i, img_b64 in enumerate(request.input_images):
             try:
                 image = decode_base64_image(img_b64)
-                image = await preprocess_single_image_async(image)
                 images.append(image)
-                logger.info(f"✅ Processed image {i+1}/{len(request.input_images)}")
             except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Error processing image {i+1}: {str(e)}")
+                raise HTTPException(status_code=400, detail=f"Error decoding image {i+1}: {str(e)}")
 
-        # Combine images using refactored function
+        # Combine or select the image
         if len(images) == 2:
-            input_image = await combine_couple_images_async(images[0], images[1])
+            # Combine the raw images first
+            combined_image = await combine_couple_images_async(images[0], images[1])
+            # NOW, preprocess the final combined image ONCE
+            input_image = await preprocess_single_image_async(combined_image)
+            logger.info("✅ Combined and processed 2 images.")
         elif len(images) == 1:
-            input_image = images[0]
-        else:
-            raise HTTPException(status_code=400, detail="Please provide 1 or 2 images")
+            # Process the single image
+            input_image = await preprocess_single_image_async(images[0])
+            logger.info("✅ Processed 1 image.")
 
         # Enhanced prompt
         enhanced_prompt = f"{request.prompt.strip()}, they are k144ing kissing"
