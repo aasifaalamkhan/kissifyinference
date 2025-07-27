@@ -163,7 +163,7 @@ async def startup_event():
         pipeline.load_lora_weights(
             "Remade-AI/kissing", 
             adapter_name="kissing",
-            weight_name="kissing_30_epochs..safetensors"
+            weight_name="kissing_30_epochs.safetensors"
         )
         
         # Move to GPU and optimize
