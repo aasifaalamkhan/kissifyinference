@@ -14,7 +14,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from diffusers import WanPipeline
+from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+from transformers import CLIPVisionModel
 import imageio
 import b2sdk.v2 as b2
 from contextlib import asynccontextmanager
@@ -113,27 +114,25 @@ app.add_middleware(
 )
 
 async def startup_event():
-    """Initialize the model and services"""
+    #Initialize the model and services#
     global pipeline, device, b2_api, b2_bucket, redis_client
     
     logger.info("🚀 Starting secure inference server...")
     
-    # Initialize Redis for rate limiting and user management
+    # Initialize Redis
     redis_client = redis.Redis(
         host=os.getenv('REDIS_HOST', 'localhost'),
         port=int(os.getenv('REDIS_PORT', 6379)),
         password=os.getenv('REDIS_PASSWORD'),
-        db=0,  # Different DB from job storage
+        db=0,
         decode_responses=True
     )
     
-    # Test Redis connection
     try:
         redis_client.ping()
         logger.info("✅ Redis connected for authentication")
     except Exception as e:
         logger.error(f"❌ Redis connection failed: {e}")
-        # Continue without Redis (degraded mode)
         redis_client = None
     
     # GPU setup
@@ -150,12 +149,24 @@ async def startup_event():
     await initialize_b2()
     
     try:
-        # Load the base model
-        logger.info("📥 Loading Wan2.1 I2V model...")
-        pipeline = WanPipeline.from_pretrained(
-            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-            torch_dtype=torch.bfloat16,
-            use_safetensors=True
+        model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+        
+        # Step 1: Load the image encoder
+        logger.info("📥 Loading Image Encoder (CLIP)...")
+        image_encoder = CLIPVisionModel.from_pretrained(
+            model_id, subfolder="image_encoder", torch_dtype=torch.bfloat16
+        )
+
+        # Step 2: Load the VAE
+        logger.info("📥 Loading VAE...")
+        vae = AutoencoderKLWan.from_pretrained(
+            model_id, subfolder="vae", torch_dtype=torch.bfloat16
+        )
+        
+        # Step 3: Load the main pipeline with the other components
+        logger.info("📥 Loading Main I2V Pipeline...")
+        pipeline = WanImageToVideoPipeline.from_pretrained(
+            model_id, image_encoder=image_encoder, vae=vae, torch_dtype=torch.bfloat16
         )
         
         # Load the kissing LoRA
@@ -166,8 +177,7 @@ async def startup_event():
             weight_name="kissing_30_epochs.safetensors"
         )
         
-        # Move to GPU and optimize
-        pipeline = pipeline.to(device)
+        pipeline.to(device)
         
         # Enable optimizations
         if hasattr(pipeline, 'enable_xformers_memory_efficient_attention'):
@@ -184,10 +194,11 @@ async def startup_event():
     except Exception as e:
         logger.error(f"❌ Failed to load model: {str(e)}")
         raise e
-
-async def shutdown_event():
-    """Cleanup resources"""
-    global pipeline, thread_pool, redis_client
+    
+    
+    async def shutdown_event():
+    # Cleanup resources
+        global pipeline, thread_pool, redis_client
     if pipeline:
         del pipeline
         torch.cuda.empty_cache()
@@ -201,7 +212,7 @@ async def shutdown_event():
 
 # Authentication functions
 async def create_jwt_token(user_data: dict, expires_delta: Optional[timedelta] = None):
-    """Create JWT token for user"""
+    # Create JWT token for user
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
@@ -212,7 +223,7 @@ async def create_jwt_token(user_data: dict, expires_delta: Optional[timedelta] =
     return encoded_jwt
 
 async def verify_jwt_token(token: str) -> dict:
-    """Verify JWT token and return user data"""
+    # Verify JWT token and return user data
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_data = payload.get("user_data")
@@ -225,7 +236,7 @@ async def verify_jwt_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 async def verify_api_key(api_key: str) -> dict:
-    """Verify API key and return user data"""
+    # Verify API key and return user data
     if not redis_client:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     
@@ -256,7 +267,7 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     api_key: Optional[str] = Header(None, alias=API_KEY_HEADER)
 ) -> User:
-    """Get current authenticated user from JWT token or API key"""
+    #Get current authenticated user from JWT token or API key#
     
     # Try API key first
     if api_key:
@@ -271,7 +282,7 @@ async def get_current_user(
     raise HTTPException(status_code=401, detail="Authentication required")
 
 async def check_rate_limits(user: User) -> dict:
-    """Check and update rate limits for user"""
+    #Check and update rate limits for user#
     if not redis_client:
         # Degraded mode - allow requests but warn
         logger.warning("⚠️ Rate limiting unavailable - Redis not connected")
@@ -325,7 +336,7 @@ async def check_rate_limits(user: User) -> dict:
         return {"allowed": True, "daily_used": 0, "monthly_used": 0}
 
 def calculate_credits_cost(request: GenerationRequest, user: User) -> int:
-    """Calculate credit cost based on request parameters and user tier"""
+    #Calculate credit cost based on request parameters and user tier#
     base_cost = 1
     
     # Frame-based pricing
@@ -353,9 +364,7 @@ async def preprocess_single_image_async(
     target_size: tuple = (512, 512),
     maintain_aspect: bool = True
 ) -> Image.Image:
-    """
-    Advanced image preprocessing function - reusable for all image operations
-    """
+    #Advanced image preprocessing function - reusable for all image operations
     def _preprocess():
         if maintain_aspect:
             # Calculate scaling to maintain aspect ratio
@@ -388,9 +397,7 @@ async def preprocess_single_image_async(
     return await asyncio.to_thread(_preprocess)
 
 async def combine_couple_images_async(img1: Image.Image, img2: Image.Image) -> Image.Image:
-    """
-    Refactored to use the superior preprocess_single_image_async function
-    """
+    #Refactored to use the superior preprocess_single_image_async function
     def _combine():
         target_height = 512
         
@@ -420,13 +427,13 @@ async def combine_couple_images_async(img1: Image.Image, img2: Image.Image) -> I
 
 # Keep original function name for backward compatibility
 async def preprocess_image_async(image: Image.Image, target_size: tuple = (512, 512)) -> Image.Image:
-    """Wrapper for backward compatibility"""
+    #Wrapper for backward compatibility#
     return await preprocess_single_image_async(image, target_size)
 
 # Authentication endpoints
 @app.post("/auth/login", response_model=AuthToken)
 async def login(request: LoginRequest):
-    """Login endpoint - simplified for demo"""
+    #Login endpoint - simplified for demo#
     # In production, verify against your user database
     if request.email == "demo@example.com" and request.password == "demo123":
         user_data = {
@@ -447,7 +454,7 @@ async def create_api_key(
     request: ApiKeyRequest,
     current_user: User = Depends(get_current_user)
 ):
-    """Create API key for user"""
+    #Create API key for user#
     if not redis_client:
         raise HTTPException(status_code=503, detail="API key service unavailable")
     
@@ -484,7 +491,7 @@ async def create_api_key(
 
 @app.get("/auth/me")
 async def get_user_profile(current_user: User = Depends(get_current_user)):
-    """Get current user profile and usage stats"""
+    #Get current user profile and usage stats#
     rate_info = await check_rate_limits(current_user)
     
     return {
@@ -499,7 +506,7 @@ async def get_user_profile(current_user: User = Depends(get_current_user)):
 
 # Initialize B2 (same as before)
 async def initialize_b2():
-    """Initialize Backblaze B2 client"""
+    #Initialize Backblaze B2 client#
     global b2_api, b2_bucket
     
     try:
@@ -524,7 +531,7 @@ async def initialize_b2():
 
 # Video processing functions (same as before but with imageio)
 async def process_frames_to_video_bytes_imageio(frames: List[np.ndarray], fps: int) -> bytes:
-    """Convert frames to MP4 video bytes using imageio (no disk I/O)"""
+    #Convert frames to MP4 video bytes using imageio (no disk I/O)#
     def _process_video():
         try:
             buffer = io.BytesIO()
@@ -566,7 +573,7 @@ async def process_frames_to_video_bytes_imageio(frames: List[np.ndarray], fps: i
     return await asyncio.to_thread(_process_video)
 
 async def create_thumbnail_bytes_imageio(frames: List[np.ndarray], timestamp_frame: int = 10) -> bytes:
-    """Create thumbnail using imageio for consistency"""
+    #Create thumbnail using imageio for consistency#
     def _create_thumbnail():
         try:
             frame_idx = min(timestamp_frame, len(frames) - 1)
@@ -599,7 +606,7 @@ async def create_thumbnail_bytes_imageio(frames: List[np.ndarray], timestamp_fra
     return await asyncio.to_thread(_create_thumbnail)
 
 async def upload_to_b2(data: bytes, filename: str, content_type: str) -> str:
-    """Upload bytes data to Backblaze B2 with retry logic"""
+    #Upload bytes data to Backblaze B2 with retry logic#
     def _upload():
         max_retries = 3
         for attempt in range(max_retries):
@@ -627,7 +634,7 @@ async def upload_to_b2(data: bytes, filename: str, content_type: str) -> str:
     return await asyncio.to_thread(_upload)
 
 def decode_base64_image(base64_string: str) -> Image.Image:
-    """Decode base64 string to PIL Image with validation"""
+    #Decode base64 string to PIL Image with validation#
     try:
         if base64_string.startswith('data:image'):
             base64_string = base64_string.split(',')[1]
@@ -650,7 +657,7 @@ def decode_base64_image(base64_string: str) -> Image.Image:
         raise HTTPException(status_code=400, detail=f"Invalid image data: {str(e)}")
 
 async def warmup_model():
-    """Warm up model with proper LoRA adapter usage"""
+    #Warm up model with proper LoRA adapter usage#
     try:
         test_image = Image.new('RGB', (512, 512), color='blue')
         test_prompt = "A couple standing together, they are k144ing kissing"
@@ -684,7 +691,7 @@ async def generate_video(
     request: GenerationRequest,
     current_user: User = Depends(get_current_user)
 ):
-    """Generate kissing video with authentication and rate limiting"""
+    #Generate kissing video with authentication and rate limiting#
     start_time = datetime.now()
 
     if not pipeline:
