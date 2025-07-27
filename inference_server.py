@@ -155,7 +155,6 @@ async def startup_event():
         pipeline = WanPipeline.from_pretrained(
             "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
             torch_dtype=torch.bfloat16,
-            variant="fp16",
             use_safetensors=True
         )
         
