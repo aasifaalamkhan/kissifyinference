@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+diffusers
+transformers
+accelerate
+xformers
+numpy
+Pillow
+imageio[ffmpeg]
+b2sdk
+python-jwt
+redis
+pydantic
