@@ -421,7 +421,6 @@ async def combine_couple_images_async(img1: Image.Image, img2: Image.Image) -> I
     
     # First combine, then use our superior preprocessing
     combined = await asyncio.to_thread(_combine)
-    return combined
     
     # Apply the same advanced preprocessing used for single images
     return await preprocess_single_image_async(combined, target_size=(512, 512))
@@ -719,8 +718,6 @@ async def generate_video(
 
         # Combine or select the image
         if len(images) == 2:
-            # Combine the raw images first
-            combined_image = await combine_couple_images_async(images[0], images[1])
             # NOW, preprocess the final combined image ONCE
             input_image = await preprocess_single_image_async(combined_image)
             logger.info("✅ Combined and processed 2 images.")
