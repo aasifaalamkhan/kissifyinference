@@ -11,3 +11,4 @@ b2sdk
 python-jwt
 redis
 pydantic
+peft
