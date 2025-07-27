@@ -100,8 +100,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Kissing Video Generator API", 
-    version="3.0.0",
-    description="Secure API for generating kissing videos with authentication",
+    version="3.0.1",
+    description="Secure API for generating kissing videos with authentication and debug features",
     lifespan=lifespan
 )
 
@@ -198,17 +198,17 @@ async def startup_event():
     
 async def shutdown_event():
 # Cleanup resources
-        global pipeline, thread_pool, redis_client
-if pipeline:
+    global pipeline, thread_pool, redis_client
+    if pipeline:
         del pipeline
         torch.cuda.empty_cache()
     
-thread_pool.shutdown(wait=True)
+    thread_pool.shutdown(wait=True)
     
-if redis_client:
+    if redis_client:
         redis_client.close()
     
-logger.info("🛑 Server shutdown complete")
+    logger.info("🛑 Server shutdown complete")
 
 # Authentication functions
 async def create_jwt_token(user_data: dict, expires_delta: Optional[timedelta] = None):
@@ -358,7 +358,7 @@ def calculate_credits_cost(request: GenerationRequest, user: User) -> int:
     final_cost = int(base_cost * frame_multiplier * resolution_multiplier * priority_multiplier * tier_discount)
     return max(1, final_cost)  # Minimum 1 credit
 
-# Refactored image processing with DRY principle
+# Image processing functions
 async def preprocess_single_image_async(
     image: Image.Image, 
     target_size: tuple = (512, 512),
@@ -396,9 +396,9 @@ async def preprocess_single_image_async(
     
     return await asyncio.to_thread(_preprocess)
 
-async def combine_couple_images_async(img1: Image.Image, img2: Image.Image) -> Image.Image:
-    #Refactored to use the superior preprocess_single_image_async function
-    def _combine():
+async def stitch_images_side_by_side_async(img1: Image.Image, img2: Image.Image) -> Image.Image:
+    """Stitches two images together side-by-side, maintaining aspect ratio."""
+    def _stitch():
         target_height = 512
         
         # Calculate aspect-preserving widths
@@ -419,16 +419,7 @@ async def combine_couple_images_async(img1: Image.Image, img2: Image.Image) -> I
         
         return combined_image
     
-    # First combine, then use our superior preprocessing
-    combined = await asyncio.to_thread(_combine)
-    
-    # Apply the same advanced preprocessing used for single images
-    return await preprocess_single_image_async(combined, target_size=(512, 512))
-
-# Keep original function name for backward compatibility
-async def preprocess_image_async(image: Image.Image, target_size: tuple = (512, 512)) -> Image.Image:
-    #Wrapper for backward compatibility#
-    return await preprocess_single_image_async(image, target_size)
+    return await asyncio.to_thread(_stitch)
 
 # Authentication endpoints
 @app.post("/auth/login", response_model=AuthToken)
@@ -504,7 +495,7 @@ async def get_user_profile(current_user: User = Depends(get_current_user)):
         }
     }
 
-# Initialize B2 (same as before)
+# B2 and Video Processing
 async def initialize_b2():
     #Initialize Backblaze B2 client#
     global b2_api, b2_bucket
@@ -529,7 +520,6 @@ async def initialize_b2():
         logger.error(f"❌ Failed to initialize B2: {str(e)}")
         raise e
 
-# Video processing functions (same as before but with imageio)
 async def process_frames_to_video_bytes_imageio(frames: List[np.ndarray], fps: int) -> bytes:
     #Convert frames to MP4 video bytes using imageio (no disk I/O)#
     def _process_video():
@@ -655,6 +645,15 @@ def decode_base64_image(base64_string: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image data: {str(e)}")
 
+async def convert_pil_to_bytes_async(image: Image.Image, format: str = "JPEG") -> bytes:
+    """Converts a PIL Image to bytes asynchronously for debugging."""
+    def _convert():
+        buffer = io.BytesIO()
+        # Use a high quality for debug images to see details clearly
+        image.save(buffer, format=format, quality=95)
+        return buffer.getvalue()
+    return await asyncio.to_thread(_convert)
+
 async def warmup_model():
     #Warm up model with proper LoRA adapter usage#
     try:
@@ -684,7 +683,7 @@ async def warmup_model():
     except Exception as e:
         logger.error(f"⚠️ Warmup failed: {str(e)}")
 
-# Secured main generation endpoint
+# Main Generation Endpoint
 @app.post("/generate", response_model=GenerationResponse)
 async def generate_video(
     request: GenerationRequest,
@@ -707,7 +706,10 @@ async def generate_video(
         logger.info(f"🎬 Starting authenticated video generation for user {current_user.user_id}")
         logger.info(f"💳 Credits cost: {credits_cost}")
 
-# Decode images first without preprocessing
+        # Use the main video timestamp for unique debug filenames
+        timestamp = int(datetime.now().timestamp())
+
+        # Decode images first
         images = []
         for i, img_b64 in enumerate(request.input_images):
             try:
@@ -716,15 +718,40 @@ async def generate_video(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Error decoding image {i+1}: {str(e)}")
 
-        # Combine or select the image
+        # --- Image Processing with Debug Uploads ---
+        
         if len(images) == 2:
-            # NOW, preprocess the final combined image ONCE
-            input_image = await preprocess_single_image_async(combined_image)
+            # Step 1: Stitch the two images side-by-side into a wide image.
+            stitched_image = await stitch_images_side_by_side_async(images[0], images[1])
+            
+            logger.info("🔧 Uploading RAW STITCHED debug image to B2...")
+            raw_bytes = await convert_pil_to_bytes_async(stitched_image)
+            raw_filename = f"debug/{current_user.user_id}/stitched_raw_{timestamp}.jpg"
+            asyncio.create_task(upload_to_b2(raw_bytes, raw_filename, "image/jpeg"))
+
+            # Step 2: Preprocess the wide, stitched image into the final square input for the model.
+            input_image = await preprocess_single_image_async(stitched_image)
+            
+            logger.info("🔧 Uploading FINAL PREPROCESSED debug image to B2...")
+            processed_bytes = await convert_pil_to_bytes_async(input_image)
+            processed_filename = f"debug/{current_user.user_id}/final_input_{timestamp}.jpg"
+            asyncio.create_task(upload_to_b2(processed_bytes, processed_filename, "image/jpeg"))
+            
             logger.info("✅ Combined and processed 2 images.")
+
         elif len(images) == 1:
-            # Process the single image
+            # For a single image, we just preprocess it directly.
             input_image = await preprocess_single_image_async(images[0])
+            
+            logger.info("🔧 Uploading FINAL PREPROCESSED debug image to B2...")
+            processed_bytes = await convert_pil_to_bytes_async(input_image)
+            processed_filename = f"debug/{current_user.user_id}/final_input_{timestamp}.jpg"
+            asyncio.create_task(upload_to_b2(processed_bytes, processed_filename, "image/jpeg"))
+            
             logger.info("✅ Processed 1 image.")
+        else:
+            raise HTTPException(status_code=400, detail="Please provide 1 or 2 input images.")
+
 
         # Enhanced prompt
         enhanced_prompt = f"{request.prompt.strip()}, they are k144ing kissing"
@@ -768,19 +795,17 @@ async def generate_video(
         logger.info("📸 Creating thumbnail with imageio...")
         thumbnail_bytes = await create_thumbnail_bytes_imageio(frames_np)
 
-        # Upload to B2
-        timestamp = int(datetime.now().timestamp())
+        # Upload final video and thumbnail to B2
         video_filename = f"videos/{current_user.user_id}/kissing_video_{timestamp}.mp4"
         thumbnail_filename = f"thumbnails/{current_user.user_id}/thumb_{timestamp}.jpg"
 
-        logger.info("☁️ Uploading to Backblaze B2...")
+        logger.info("☁️ Uploading final assets to Backblaze B2...")
         video_url, thumbnail_url = await asyncio.gather(
             upload_to_b2(video_bytes, video_filename, "video/mp4"),
             upload_to_b2(thumbnail_bytes, thumbnail_filename, "image/jpeg")
         )
 
         total_time = (datetime.now() - start_time).total_seconds()
-
         monthly_remaining = rate_info.get("monthly_remaining", 0)
 
         return GenerationResponse(
@@ -797,7 +822,11 @@ async def generate_video(
 
     except Exception as e:
         logger.error(f"❌ Video generation failed for user {current_user.user_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An internal error occurred during video generation: {str(e)}")
+        # Raise HTTPException to ensure a proper JSON error response is sent to the client
+        if isinstance(e, HTTPException):
+            raise
+        else:
+            raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
     finally:
         # This block always runs, ensuring the GPU cache is cleared.
