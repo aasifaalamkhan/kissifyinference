@@ -13,3 +13,4 @@ redis
 pydantic
 peft
 ftfy
+uvicorn  
