@@ -15,7 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 # --- MODIFIED IMPORTS ---
-from diffusers import AutoencoderKLWan, WanImageToVideoPipeline, IPAdapterModel
+from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+from diffusers.models import IPAdapterModel
 from transformers import CLIPVisionModel, CLIPImageProcessor
 import imageio
 import b2sdk.v2 as b2
