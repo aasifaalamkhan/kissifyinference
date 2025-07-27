@@ -692,6 +692,7 @@ async def generate_video(
     current_user: User = Depends(get_current_user)
 ):
     #Generate kissing video with authentication and rate limiting#
+    global pipeline
     start_time = datetime.now()
 
     if not pipeline:
@@ -734,6 +735,7 @@ async def generate_video(
         logger.info(f"📝 Using prompt: {enhanced_prompt}")
 
         # Set LoRA adapter with proper strength control
+        pipeline.load_lora_weights("Remade-AI/kissing", adapter_name="kissing", weight_name="kissing_30_epochs..safetensors")
         pipeline.set_adapters(["kissing"], adapter_weights=[request.adapter_strength])
         logger.info(f"🎛️ Set LoRA adapter strength: {request.adapter_strength}")
 
